@@ -1,0 +1,46 @@
+cmake_minimum_required(VERSION 3.10) # 指定CMake的最低版本要求
+
+
+# 设置项目名称和版本
+project(poisson_recon LANGUAGES CXX CUDA) # 项目名称
+
+# 设置C++标准
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+SET(CMAKE_BUILD_TYPE "Debug")
+SET(CMAKE_CXX_FLAGS_DEBUG "-O0 -Wall -g2 -ggdb")
+SET(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall")
+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+set(CMAKE_CUDA_ARCHITECTURES 70 75 80)
+endif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+
+if(POLICY CMP0146)
+  cmake_policy(SET CMP0146 OLD) 
+endif()
+
+# 寻找 CUDA
+find_package(CUDA REQUIRED)
+
+# 包含头文件
+include_directories("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/include")
+include_directories(${PROJECT_SOURCE_DIR}/src/include)
+link_directories("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/lib")
+
+# 设置源文件
+set(SOURCE_FILES
+    # 在此处添加其他cpp源文件
+    )
+
+file(GLOB cuda_source_files ${PROJECT_SOURCE_DIR}/src/*.cu ${PROJECT_SOURCE_DIR}/src/*.cuh ${PROJECT_SOURCE_DIR}/src/*.h)
+# 添加可执行文件
+
+add_executable(bfgs ${SOURCE_FILES} ${cuda_source_files})
+set_target_properties(bfgs PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON)
+
+target_compile_options(bfgs PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-arch=sm_80>
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+)
+target_link_libraries(bfgs PRIVATE ${CUDA_cusparse_LIBRARY} ${CUDA_cusolver_LIBRARY} cublas ${PCL_LIBRARIES})
