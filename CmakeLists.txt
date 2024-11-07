@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10) # 指定CMake的最低版本要求
 
 
 # 设置项目名称和版本
-project(poisson_recon LANGUAGES CXX CUDA) # 项目名称
+project(bfgs LANGUAGES CXX CUDA) # 项目名称
 
 # 设置C++标准
 set(CMAKE_CXX_STANDARD 11)
