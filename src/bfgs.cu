@@ -719,7 +719,7 @@ __device__ void gpuDotProduct(double *vecA, double *vecB, double *result,
         tmp[tile32.meta_group_rank()] = temp_sum;
     }
 
-    cta.sync();
+    cg::sync(cta);
 
     if (tile32.meta_group_rank() == 0) {
         temp_sum = tile32.thread_rank() < tile32.meta_group_size() ? tmp[tile32.thread_rank()] : 0.0;
@@ -768,62 +768,54 @@ extern "C" __global__ void BFGSMultiply(
 
     // Compute y = gNow - gPrev
     gpuSaxpy(gPrev, gNow, y, alpham1, n, grid);
-    grid.sync();
+    cg::sync(grid);
 
     // Compute s = xNow - xPrev
     gpuSaxpy(xPrev, xNow, s, alpham1, n, grid);
-    grid.sync();
+    cg::sync(grid);
 
     // Compute sy = dot(s, y)
     gpuDotProduct(s, y, sy, n, cta, grid);
-    grid.sync();
-
-	double t = 0.0;
-	for(int i = 0; i < n; i++)
-	{
-		t += s[i] * y[i];
-	}
+    cg::sync(grid);
 
     // Proceed only if sy is above a certain threshold (epsZero1)
     if (fabs(*sy) >= epsZero1) {
         // Compute yTH = H * y
         gpuSpVM(H, y, yTH, n, n, alpha, cta, grid);
-        grid.sync();
+        cg::sync(grid);
 
         // Compute Hy = H * y
         gpuSpMV(H, y, Hy, n, n, alpha, cta, grid);
-        grid.sync();
+        cg::sync(grid);
 
         // Initialize dot_result to zero
         if (threadIdx.x == 0 && blockIdx.x == 0) *dot_result = 0;
-        grid.sync();
+        cg::sync(grid);
 
         // Compute dot_result = dot(yTH, y)
         gpuDotProduct(yTH, y, dot_result, n, cta, grid);
-        grid.sync();
-		// if(threadIdx.x == 0 && blockIdx.x == 0)
-		// 	printf("dot_result = %f\n", *dot_result);
+        cg::sync(grid);
         // Update H matrix with computed values
         double tmp = 1.0 + *dot_result / *sy;
 
         gpuHUpdate(H, Hy, yTH, tmp, *sy, s, n, grid);
-        grid.sync();
+        cg::sync(grid);
 
         // Compute p = -H * gNow
         gpuSpMV(H, gNow, p, n, n, alpham1, cta, grid);
-        grid.sync();
+        cg::sync(grid);
 
         // Re-initialize dot_result to zero before re-use
         if (threadIdx.x == 0 && blockIdx.x == 0) *dot_result = 0;
-        grid.sync();
+        cg::sync(grid);
 
         // Compute the norm of p
         gpuDotProduct(p, p, dot_result, n, cta, grid);
-        grid.sync();
+        cg::sync(grid);
 
         // Normalize p to unit length
         gpuScaleVector(p, 1.0 / sqrt(*dot_result), n, grid);
-        grid.sync();
+        cg::sync(grid);
     }
 }
 
@@ -939,7 +931,6 @@ int BFGSSolveEqs()
 	checkCudaErrors(cudaMalloc(&d_sy, sizeof(double)));
 	checkCudaErrors(cudaMalloc(&d_dot_result, sizeof(double)));
 
-//STEP1:
 	fPrev = _CalcObj(xNow, objEqs, numObjEqs);
 	_CalcGrad(xNow, gPrev, gradEqs);
 	
@@ -974,52 +965,22 @@ int BFGSSolveEqs()
 
 			_CalcGrad(xNow, gNow, gradEqs);
 
-		//STEP4:
 			if (_HTerminate(xPrev, xNow, fPrev, fNow, gNow))
 			{
 				exit_con = true;
 				break;
 			}
 
-		//STEP5:
 			if (fNow > fPrev) {
 				_VecCopy(xNow, xPrev);
 				break;
 			}
 
-		//STEP6:
 			if (k == n) {
 				fPrev = fNow;
 				_VecCopy(gPrev, gNow);
 				break;
 			}
-
-		//STEP7:
-			// _VecSub(gNow, gPrev, y);
-			// _VecSub(xNow, xPrev, s);
-
-			// {
-			// 	double sy = _VecDot(s, y);
-			// 	// if (fabs(sy) < epsZero1)
-			// 	// 	goto END;
-
-			// 	_CalcyTH(y, H, yTH);
-			// 	_CalcHy(H, y, Hy);
-
-			// 	double tmp = (1.0 + _VecDot(yTH, y) / sy);
-			// 	for (int i = 0; i < n; i++)
-			// 		for (int j = 0; j < n; j++)
-			// 			H(i, j) += (((tmp * s[i] * s[j]) - Hy[i] * s[j] -
-			// 				s[i] * yTH[j]) / sy);
-			// 	_Calcp(H, gNow, p);
-			// 	_VecNorm(p);
-
-			// 	fPrev = fNow;
-			// 	_VecCopy(gPrev, gNow);
-			// 	_VecCopy(xPrev, xNow);
-			// 	// goto STEP3;
-			// }
-
 			checkCudaErrors(cudaMemcpy(d_gnow, gNow.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
 			checkCudaErrors(cudaMemcpy(d_gprev, gPrev.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
 			checkCudaErrors(cudaMemcpy(d_H, H.data(), sizeof(double) * n * n, cudaMemcpyHostToDevice));
@@ -1055,18 +1016,6 @@ int BFGSSolveEqs()
 			checkCudaErrors(cudaMemcpy(y1.data(), d_y, sizeof(double) * n, cudaMemcpyDeviceToHost));
 			checkCudaErrors(cudaMemcpy(s1.data(), d_s, sizeof(double) * n, cudaMemcpyDeviceToHost));
 
-			for(int i = 0; i < n; i++)
-			{
-				if(y[i] != y1[i])
-				{
-					printf("y[%d] = %f, y1[%d] = %f\n", i, y[i], i, y1[i]);
-				}
-				if(s[i] != s1[i])
-				{
-					printf("s[%d] = %f, s1[%d] = %f\n", i, s[i], i, s1[i]);
-				}
-			}
-
 			fPrev = fNow;
 			gPrev = gNow;
 			xPrev = xNow;
@@ -1082,137 +1031,9 @@ int BFGSSolveEqs()
 				exit_con = true;
 				break;
 			}
-			// printf("launch successfully\n");
 		}
 	}
 
-// STEP2:
-// 	for (int i = 0; i < n; i++) {
-// 		H(i, i) = 1.0;
-// 		p[i] = -gPrev[i];
-// 	}
-// 	k = 0;
-// 	_VecNorm(p);
-
-// STEP3:
-// 	if (itCounter++ > itMax)
-// 		goto END;
-
-// 	xPrev = xNow;
-// 	_LinearSearch(xPrev, p, step, xNow, objEqs, numObjEqs);
-// 	fNow = _CalcObj(xNow, objEqs, numObjEqs);
-// 	std::cout << itCounter << " iterations, " <<	"f(x) = " << fNow << std::endl;
-
-// 	if (fNow < eps)
-// 		goto END;
-
-// 	_CalcGrad(xNow, gNow, gradEqs);
-
-// //STEP4:
-// 	if (_HTerminate(xPrev, xNow, fPrev, fNow, gNow))
-// 		goto END;
-
-// //STEP5:
-// 	if (fNow > fPrev) {
-// 		_VecCopy(xNow, xPrev);
-// 		goto STEP2;
-// 	}
-
-// //STEP6:
-// 	if (k == n) {
-// 		fPrev = fNow;
-// 		_VecCopy(gPrev, gNow);
-// 		goto STEP2;
-// 	}
-
-// //STEP7:
-// 	// _VecSub(gNow, gPrev, y);
-// 	// _VecSub(xNow, xPrev, s);
-
-// 	// {
-// 	// 	double sy = _VecDot(s, y);
-// 	// 	// if (fabs(sy) < epsZero1)
-// 	// 	// 	goto END;
-
-// 	// 	_CalcyTH(y, H, yTH);
-// 	// 	_CalcHy(H, y, Hy);
-
-// 	// 	double tmp = (1.0 + _VecDot(yTH, y) / sy);
-// 	// 	for (int i = 0; i < n; i++)
-// 	// 		for (int j = 0; j < n; j++)
-// 	// 			H(i, j) += (((tmp * s[i] * s[j]) - Hy[i] * s[j] -
-// 	// 				s[i] * yTH[j]) / sy);
-// 	// 	_Calcp(H, gNow, p);
-// 	// 	_VecNorm(p);
-
-// 	// 	fPrev = fNow;
-// 	// 	_VecCopy(gPrev, gNow);
-// 	// 	_VecCopy(xPrev, xNow);
-// 	// 	// goto STEP3;
-// 	// }
-// 	cudaDeviceProp deviceProp;
-//     int devID = 0;
-//     checkCudaErrors(cudaGetDeviceProperties(&deviceProp, devID));
-
-//     if (!deviceProp.managedMemory) {
-//         // This sample requires being run on a device that supports Unified Memory
-//         fprintf(stderr, "Unified Memory not supported on this device\n");
-//         exit(EXIT_WAIVED);
-//     }
-
-//     // This sample requires being run on a device that supports Cooperative Kernel
-//     // Launch
-//     if (!deviceProp.cooperativeLaunch) {
-//         printf(
-//                 "\nSelected GPU (%d) does not support Cooperative Kernel Launch, "
-//                 "Waiving the run\n",
-//                 devID);
-//         exit(EXIT_WAIVED);
-//     }
-
-// 	checkCudaErrors(cudaMemcpy(d_gnow, gNow.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
-// 	checkCudaErrors(cudaMemcpy(d_gprev, gPrev.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
-// 	checkCudaErrors(cudaMemcpy(d_H, H.data(), sizeof(double) * n * n, cudaMemcpyHostToDevice));
-// 	checkCudaErrors(cudaMemcpy(d_xnow, xNow.data(),	sizeof(double) * n, cudaMemcpyHostToDevice));
-// 	checkCudaErrors(cudaMemcpy(d_xprev, xPrev.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
-
-// 	void *kernelArgs[] = {
-// 			(void*)&d_gprev, (void*)&d_gnow, (void*)&d_xprev, (void*)&d_xnow, (void*)&d_H, (void*)&d_p, (void*)&d_yTH, (void*)&d_Hy, (void*)&d_s, (void*)&d_y, (void*)&d_sy, (void*)&d_dot_result, (void*)&n
-// 	};
-
-//     int sMemSize = sizeof(double) * ((THREADS_PER_BLOCK/32) + 1);
-//     int numBlocksPerSm = 0;
-//     int numThreads = THREADS_PER_BLOCK;
-
-//     checkCudaErrors(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-//         &numBlocksPerSm, BFGSMultiply, numThreads, sMemSize));
-
-//     int numSms = deviceProp.multiProcessorCount;
-//     dim3 dimGrid(numSms * numBlocksPerSm, 1, 1),
-//         dimBlock(THREADS_PER_BLOCK, 1, 1);
-//     checkCudaErrors(cudaLaunchCooperativeKernel((void *)BFGSMultiply,
-//                                                 dimGrid, dimBlock, kernelArgs,
-//                                                 sMemSize, NULL));	
-
-// 	checkCudaErrors(cudaDeviceSynchronize());
-
-// 	fPrev = fNow;
-// 	gPrev = gNow;
-// 	xPrev = xNow;
-// 	double sy = 0;
-// 	checkCudaErrors(cudaMemcpy(p.data(), d_p, sizeof(double) * n, cudaMemcpyDeviceToHost));
-// 	checkCudaErrors(cudaMemcpy(&sy, d_sy, sizeof(double), cudaMemcpyDeviceToHost));
-// 	checkCudaErrors(cudaMemcpy(H.data(), d_H, sizeof(double) * n * n, cudaMemcpyDeviceToHost));
-
-	
-
-// 	if(sy < epsZero1)
-// 		goto END;
-// 	// printf("launch successfully\n");
-	
-// 	goto STEP3;
-
-// END:
 	std::cout << itCounter << " iterations" << std::endl;
 	std::cout << "f(x) = " << fNow << std::endl;
 	double dt = omp_get_wtime()-t0;
