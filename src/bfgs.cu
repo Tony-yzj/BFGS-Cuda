@@ -657,7 +657,7 @@ AnalysisEqs(const std::vector<EqInfo>& eqTab, int eqNum, std::vector<int>& eqHea
 	}
 }
 
-__device__ double evaluate_operator(int op, double left, double right) {
+__device__ inline double evaluate_operator(int op, double left, double right) {
     switch (op) {
         case OP_PLUS:   return left + right;
         case OP_MINUS:  return left - right;
@@ -843,6 +843,357 @@ __device__ bool gpuHTerminate(
 	return true;
 }
 
+__device__ void gpuCalcEq(double* x, EqInfo* etab, int st, int ed, double* vtab)
+{
+	for (int i = ed - 1; i >= st; i--) 
+	{
+		const EqInfo eq = etab[i];
+		if (eq._type == NODE_CONST)
+		{
+			vtab[i] = eq._val;
+		} 
+		else if (eq._type == NODE_VAR)
+		{
+			int idx = eq._var;
+			vtab[i] = x[idx];
+		}
+		else if (eq._type == NODE_OPER)
+		{
+			double left = vtab[eq._left];
+			double right = vtab[eq._right];
+			vtab[i] = evaluate_operator(eq._op, left, right);
+		}
+	}
+}
+
+
+__global__ void gpuCalcGrad(double* x, double* g, int n, int allnum, int* gradEqHeads,
+	EqInfo* eqs, double* gradEqVal)
+{
+	int gthIdx = blockIdx.x * blockDim.x + threadIdx.x;
+	int gridSize = gridDim.x * blockDim.x;
+
+	for (int i = gthIdx; i < n; i += gridSize)
+	{
+		int item = i == n - 1 ? -i : i;
+		int ed = item < 0 ? allnum : gradEqHeads[item + 1];
+		int st = item < 0 ? gradEqHeads[-item] : gradEqHeads[item];
+
+		gpuCalcEq(x, eqs, st, ed, gradEqVal);
+
+		EqInfo eq = eqs[i];
+		if(eq._type == NODE_OPER)
+		{
+			double left = gradEqVal[eq._left];
+			double right = gradEqVal[eq._right];
+			g[i] = evaluate_operator(eq._op, left, right);
+		}
+		else
+		{
+			g[i] = 0.0;
+			assert(0);
+		}
+	}
+}
+
+__global__ void gpuCalcObj(double* x, double* tmp, int eqNum, int allNum, int* objEqHeads,
+	EqInfo* eqs, double* objEqVal, double* result)
+{
+	cg::thread_block cta = cg::this_thread_block();
+    cg::grid_group grid = cg::this_grid();
+	
+	if(threadIdx.x == 0 && blockIdx.x == 0) *result = 0.0;
+	cg::sync(grid);
+	
+	for (int i = grid.thread_rank(); i < eqNum; i += grid.size())
+	{
+		int item = i == eqNum - 1 ? -i : i;
+		int ed = item < 0 ? allNum : objEqHeads[item + 1];
+		int st = item < 0 ? objEqHeads[-item] : objEqHeads[item];
+
+		gpuCalcEq(x, eqs, st, ed, objEqVal);
+
+		EqInfo eq = eqs[i];
+		if(eq._type == NODE_OPER)
+		{
+			double left = objEqVal[eq._left];
+			double right = objEqVal[eq._right];
+			tmp[i] = evaluate_operator(eq._op, left, right);
+		}
+		else
+		{
+			tmp[i] = 0.0;
+			assert(0);
+		}
+	}
+
+	cg::sync(grid);
+
+	gpuDotProduct(tmp, tmp, result, eqNum, cta, grid);
+	cg::sync(grid);
+}
+
+__device__ void gpuCalcGradx(double* x, double* g, int n, int allnum, int* gradEqHeads,
+	EqInfo* eqs, double* gradEqVal, const cg::grid_group &grid)
+{
+	int gthIdx = blockIdx.x * blockDim.x + threadIdx.x;
+	int gridSize = gridDim.x * blockDim.x;
+
+	for (int i = grid.thread_rank(); i < n; i += grid.size())
+	{
+		int item = i == n - 1 ? -i : i;
+		int ed = item < 0 ? allnum : gradEqHeads[item + 1];
+		int st = item < 0 ? gradEqHeads[-item] : gradEqHeads[item];
+
+		gpuCalcEq(x, eqs, st, ed, gradEqVal);
+
+		EqInfo eq = eqs[i];
+		if(eq._type == NODE_OPER)
+		{
+			double left = gradEqVal[eq._left];
+			double right = gradEqVal[eq._right];
+			g[i] = evaluate_operator(eq._op, left, right);
+		}
+		else
+		{
+			g[i] = 0.0;
+			assert(0);
+		}
+	}
+}
+
+__device__ void gpuCalcObjOffset(double *xt, double* result, double* tmp, int allNum, EqInfo* eqs, int* objEqHeads, double* objEqVal, int eqNum, int n, cooperative_groups::thread_block& cta, cooperative_groups::grid_group& grid)
+{
+
+	if(threadIdx.x == 0 && blockIdx.x == 0) *result = 0.0;
+	cg::sync(grid);
+	
+	for (int i = grid.thread_rank(); i < eqNum; i += grid.size())
+	{
+		int item = i == eqNum - 1 ? -i : i;
+		int ed = item < 0 ? allNum : objEqHeads[item + 1];
+		int st = item < 0 ? objEqHeads[-item] : objEqHeads[item];
+
+		gpuCalcEq(xt, eqs, st, ed, objEqVal);
+
+		EqInfo eq = eqs[i];
+		if(eq._type == NODE_OPER)
+		{
+			double left = objEqVal[eq._left];
+			double right = objEqVal[eq._right];
+			tmp[i] = evaluate_operator(eq._op, left, right);
+		}
+		else
+		{
+			tmp[i] = 0.0;
+			assert(0);
+		}
+	}
+
+	cg::sync(grid);
+
+	gpuDotProduct(tmp, tmp, result, eqNum, cta, grid);
+	cg::sync(grid);
+}
+
+__global__ void gpuDetermineInterval(
+    double* x0, double h, double* p, double* xt, int n,
+    double* left, double* right, double* result, double* tmp,
+    EqInfo* eqs, int eqNum, int allNum, int* objEqHeads,
+	double* objEqVal)
+{
+    double A, B, C, D, u, v, w, s, r;
+	
+	cg::thread_block cta = cg::this_thread_block();
+    cg::grid_group grid = cg::this_grid();
+    // Initialize A and B with values from _CalcObj
+	// xt = x0 + h * p
+	gpuSaxpy(p, x0, xt, h, n, grid);
+	cg::sync(grid);
+
+	gpuCalcObjOffset(x0, result, tmp, allNum, eqs, objEqHeads, objEqVal, eqNum, n, cta, grid);
+
+	A = *result;
+	cg::sync(grid);
+	
+	gpuCalcObjOffset(xt, result, tmp, allNum, eqs, objEqHeads, objEqVal, eqNum, n, cta, grid);
+	
+	B = *result;
+	cg::sync(grid);
+	
+    // A = _CalcObj(x0, 0.0, p, eqs, eqNum);
+    // B = _CalcObj(x0, h, p, eqs, eqNum);
+    if (B > A) {
+        s = -h;
+		gpuSaxpy(p, x0, xt, s, n, grid);
+		cg::sync(grid);
+        // C = _CalcObj(x0, s, p, eqs, eqNum);
+		gpuCalcObjOffset(xt, result, tmp, allNum, eqs, objEqHeads, objEqVal, eqNum, n, cta, grid);
+
+		C = *result;
+		cg::sync(grid);
+		
+        if (C > A) {
+            *left = -h;
+            *right = h;
+            return;
+        }
+        B = C;
+    }
+    else {
+        s = h;
+    }
+
+    // Initialize u and v
+    u = 0.0;
+    v = s;
+
+    while (1) {
+        s += s;
+        if (fabs(s) > BFGS_MAXBOUND) {
+            *left = *right = 0.0;
+            return;
+        }
+
+        // Calculate w and evaluate C at w
+        w = v + s;
+		gpuSaxpy(p, x0, xt, w, n, grid);
+		cg::sync(grid);
+		gpuCalcObjOffset(xt, result, tmp, allNum, eqs, objEqHeads, objEqVal, eqNum, n, cta, grid);
+
+		C = *result;
+		cg::sync(grid);
+        // C = _CalcObj(x0, w, p, eqs, eqNum);
+
+        if (C >= B)
+            break;
+
+        // Update values for u, A, v, and B
+        u = v;
+        A = B;
+        v = w;
+        B = C;
+    }
+
+    // Midpoint calculation for r
+    r = (v + w) * 0.5;
+	gpuSaxpy(p, x0, xt, r, n, grid);
+	cg::sync(grid);
+	gpuCalcObjOffset(xt, result, tmp, allNum, eqs, objEqHeads, objEqVal, eqNum, n, cta, grid);
+	D = *result;
+	cg::sync(grid);
+    // D = _CalcObj(x0, r, p, eqs, eqNum);
+
+    // Set interval bounds based on s
+    if (s < 0.0) {
+        if (D < B) {
+            *left = w;
+            *right = v;
+        }
+        else {
+            *left = r;
+            *right = u;
+        }
+    }
+    else {
+        if (D < B) {
+            *left = v;
+            *right = w;
+        }
+        else {
+            *left = u;
+            *right = r;
+        }
+    }
+}
+
+__global__ void gpuGodenSep(
+	double* x0, double* p, double* xt, double* x, int n,
+    double *left, double *right, double* result, double* tmp,
+    EqInfo* eqs, int eqNum, int allNum, int* objEqHeads,
+	double* objEqVal)
+{
+	static double	beta = 0.61803398874989484820;
+	double			t1, t2, f1, f2;
+	bool mark = true;
+
+	cg::thread_block cta = cg::this_thread_block();
+    cg::grid_group grid = cg::this_grid();
+
+	if(*left == *right)
+		return;
+
+	t2 = *left + beta * (*right - *left);
+	gpuSaxpy(p, x0, xt, t2, n, grid);
+	cg::sync(grid);
+	gpuCalcObjOffset(xt, result, tmp, allNum, eqs, objEqHeads, objEqVal, eqNum, n, cta, grid);
+	f2 = *result;
+	cg::sync(grid);
+	while(1)
+	{
+		if(mark)
+		{
+			t1 = *left + *right - t2;
+			gpuSaxpy(p, x0, xt, t1, n, grid);
+			cg::sync(grid);
+			gpuCalcObjOffset(xt, result, tmp, allNum, eqs, objEqHeads, objEqVal, eqNum, n, cta, grid);
+			f1 = *result;
+			cg::sync(grid);
+		}
+
+		if (fabs(t1 - t2) < epsZero2) 
+		{
+			t1 = (t1 + t2) / 2.0;
+			gpuSaxpy(p, x0, x, t1, n, grid);
+			cg::sync(grid);
+			break;
+		}
+		if ((fabs(*left) > BFGS_MAXBOUND) || (fabs(*left) > BFGS_MAXBOUND))
+			break;
+		if (f1 <= f2) 
+		{
+			*right = t2;
+			t2 = t1;
+			f2 = f1;
+			mark = true;
+		}
+		else 
+		{
+			*left = t1;
+			t1 = t2;
+			f1 = f2;
+			t2 = *left + beta * (*right - *left);
+			gpuSaxpy(p, x0, xt, t2, n, grid);
+			cg::sync(grid);
+			gpuCalcObjOffset(xt, result, tmp, allNum, eqs, objEqHeads, objEqVal, eqNum, n, cta, grid);
+			f2 = *result;
+			cg::sync(grid);
+			mark = false;
+		}
+	}
+}
+
+__global__ void gpuInitHp(double* H, double* p, double* gPrev, double* result, int n)
+{
+	cg::thread_block cta = cg::this_thread_block();
+    cg::grid_group grid = cg::this_grid();
+	
+	double alpham1 = -1.0;
+	
+	for(int i = grid.thread_rank(); i < n; i += grid.size())
+	{
+		H[i * n + i] = 1.0;
+		p[i] = alpham1 * gPrev[i];
+	}
+	
+	cg::sync(grid);
+	
+	gpuDotProduct(p, p, result, n, cta, grid);
+	cg::sync(grid);
+	gpuScaleVector(p, 1.0/sqrt(*result), n, grid);
+	cg::sync(grid);
+}
+
 extern "C" __global__ void BFGSMultiply(
     double* gPrev, double* gNow, double* xPrev, double* xNow, double* H,
     double* p, double* yTH, double* Hy, double* s, double* y, double fPrev, double fNow,
@@ -918,118 +1269,6 @@ extern "C" __global__ void BFGSMultiply(
 		cg::sync(grid);
 	}
 }
-
-__device__ void gpuCalcEq(double* x, EqInfo* etab, int st, int ed, double* vtab)
-{
-	for (int i = ed - 1; i >= st; i--) 
-	{
-		const EqInfo eq = etab[i];
-		if (eq._type == NODE_CONST)
-		{
-			vtab[i] = eq._val;
-		} 
-		else if (eq._type == NODE_VAR)
-		{
-			int idx = eq._var;
-			vtab[i] = x[idx];
-		}
-		else if (eq._type == NODE_OPER)
-		{
-			double left = vtab[eq._left];
-			double right = vtab[eq._right];
-			vtab[i] = evaluate_operator(eq._op, left, right);
-		}
-	}
-}
-
-
-__global__ void gpuCalcGrad(double* x, double* g, int n, int allnum, int* gradEqHeads,
-	EqInfo* eqs, double* gradEqVal)
-{
-	int gthIdx = blockIdx.x * blockDim.x + threadIdx.x;
-	int gridSize = gridDim.x * blockDim.x;
-
-	for (int i = gthIdx; i < n; i += gridSize)
-	{
-		int item = i == n - 1 ? -i : i;
-		int ed = item < 0 ? allnum : gradEqHeads[item + 1];
-		int st = item < 0 ? gradEqHeads[-item] : gradEqHeads[item];
-
-		gpuCalcEq(x, eqs, st, ed, gradEqVal);
-
-		EqInfo eq = eqs[i];
-		if(eq._type == NODE_OPER)
-		{
-			double left = gradEqVal[eq._left];
-			double right = gradEqVal[eq._right];
-			g[i] = evaluate_operator(eq._op, left, right);
-		}
-		else
-		{
-			g[i] = 0.0;
-			assert(0);
-		}
-	}
-}
-
-__global__ void gpuCalcObj(double* x, double* g, int n, int allnum, int* gradEqHeads,
-	EqInfo* eqs, double* gradEqVal)
-{
-	int gthIdx = blockIdx.x * blockDim.x + threadIdx.x;
-	int gridSize = gridDim.x * blockDim.x;
-
-	for (int i = gthIdx; i < n; i += gridSize)
-	{
-		int item = i == n - 1 ? -i : i;
-		int ed = item < 0 ? allnum : gradEqHeads[item + 1];
-		int st = item < 0 ? gradEqHeads[-item] : gradEqHeads[item];
-
-		gpuCalcEq(x, eqs, st, ed, gradEqVal);
-
-		EqInfo eq = eqs[i];
-		if(eq._type == NODE_OPER)
-		{
-			double left = gradEqVal[eq._left];
-			double right = gradEqVal[eq._right];
-			g[i] = evaluate_operator(eq._op, left, right);
-		}
-		else
-		{
-			g[i] = 0.0;
-			assert(0);
-		}
-	}
-}
-
-__device__ void gpuCalcGradx(double* x, double* g, int n, int allnum, int* gradEqHeads,
-	EqInfo* eqs, double* gradEqVal, const cg::grid_group &grid)
-{
-	int gthIdx = blockIdx.x * blockDim.x + threadIdx.x;
-	int gridSize = gridDim.x * blockDim.x;
-
-	for (int i = grid.thread_rank(); i < n; i += grid.size())
-	{
-		int item = i == n - 1 ? -i : i;
-		int ed = item < 0 ? allnum : gradEqHeads[item + 1];
-		int st = item < 0 ? gradEqHeads[-item] : gradEqHeads[item];
-
-		gpuCalcEq(x, eqs, st, ed, gradEqVal);
-
-		EqInfo eq = eqs[i];
-		if(eq._type == NODE_OPER)
-		{
-			double left = gradEqVal[eq._left];
-			double right = gradEqVal[eq._right];
-			g[i] = evaluate_operator(eq._op, left, right);
-		}
-		else
-		{
-			g[i] = 0.0;
-			assert(0);
-		}
-	}
-}
-
 
 int BFGSSolveEqs()
 {
@@ -1129,13 +1368,16 @@ int BFGSSolveEqs()
 	Hy.resize(n);
 	H.resize(n, n);
 
-	double *d_gnow, *d_gprev, *d_xnow, *d_xprev, *d_s, *d_y, *d_yTH, *d_Hy, *d_p, *d_H, *d_sy, *d_dot_result, *d_gradEqVals, *d_objEqVals;
+	double *d_gnow, *d_gprev, *d_xnow, *d_xprev, *left, *right, *d_xt, *d_s, *d_y, *d_yTH, *d_Hy, *d_p, *d_H, *d_sy, *d_dot_result, *d_gradEqVals, *d_objEqVals, *d_fprev, *d_fnow, *tmp;
 	EqInfo* d_gradEqls, *d_objEqls;
 	int* d_gradEqHeads, *d_objEqHeads;
 	checkCudaErrors(cudaMalloc(&d_gnow, sizeof(double) * n));
 	checkCudaErrors(cudaMalloc(&d_gprev, sizeof(double) * n));
 	checkCudaErrors(cudaMalloc(&d_xnow, sizeof(double) * n));
 	checkCudaErrors(cudaMalloc(&d_xprev, sizeof(double) * n));
+	checkCudaErrors(cudaMalloc(&d_xt, sizeof(double) * n));
+	checkCudaErrors(cudaMalloc(&left, sizeof(double)));
+	checkCudaErrors(cudaMalloc(&right, sizeof(double)));
 	checkCudaErrors(cudaMalloc(&d_s, sizeof(double) * n));
 	checkCudaErrors(cudaMalloc(&d_y, sizeof(double) * n));
 	checkCudaErrors(cudaMalloc(&d_yTH, sizeof(double) * n));
@@ -1150,7 +1392,9 @@ int BFGSSolveEqs()
 	checkCudaErrors(cudaMalloc(&d_objEqHeads, sizeof(int) * objEqHeads.size()));
 	checkCudaErrors(cudaMalloc(&d_gradEqVals, sizeof(double) * gradEqVals.size()));
 	checkCudaErrors(cudaMalloc(&d_objEqVals, sizeof(double) * objEqVals.size()));
-
+	checkCudaErrors(cudaMalloc(&d_fprev, sizeof(double)));
+	checkCudaErrors(cudaMalloc(&d_fnow, sizeof(double)));
+	checkCudaErrors(cudaMalloc(&tmp, sizeof(double) * numObjEqs));
 	checkCudaErrors(cudaMemcpy(d_gradEqHeads, gradEqHeads.data(), sizeof(int) * gradEqHeads.size(), cudaMemcpyHostToDevice));
 	checkCudaErrors(cudaMemcpy(d_objEqHeads, objEqHeads.data(), sizeof(int) * objEqHeads.size(), cudaMemcpyHostToDevice));
 	checkCudaErrors(cudaMemcpy(d_gradEqls, gradEqs.data(), sizeof(EqInfo) * gradEqs.size(), cudaMemcpyHostToDevice));
@@ -1168,19 +1412,28 @@ int BFGSSolveEqs()
 		dimBlock(THREADS_PER_BLOCK, 1, 1);
 
 	int allnum = gradEqVals.size();
+	int allnumObj = objEqVals.size();
 
 	fPrev = _CalcObj(xNow, objEqs, numObjEqs);
 	_CalcGrad(xNow, gPrev, gradEqs);
+	checkCudaErrors(cudaMemcpy(d_gprev, gPrev.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
+	checkCudaErrors(cudaMemcpy(d_xnow, xNow.data(),	sizeof(double) * n, cudaMemcpyHostToDevice));
 	
 	bool exit_con = false;
 	while(!exit_con)
 	{
-		for (int i = 0; i < n; i++) {
-			H(i, i) = 1.0;
-			p[i] = -gPrev[i];
-		}
-		k = 0;
-		_VecNorm(p);
+		void* kernelArgsInit[] = {
+			(void*)&d_H,
+			(void*)&d_p,
+			(void*)&d_gprev,
+			(void*)&d_dot_result,
+			(void*)&n
+		};
+		
+		dim3 dimGrid1(16,1,1), dimBlock1(32,1,1);
+		checkCudaErrors(cudaLaunchCooperativeKernel((void *)gpuInitHp,
+													dimGrid1, dimBlock1, kernelArgsInit,
+													sMemSize, NULL));
 
 		while(true)
 		{
@@ -1189,19 +1442,8 @@ int BFGSSolveEqs()
 				exit_con = true;
 				break;
 			}
-
-			xPrev = xNow;
-			_LinearSearch(xPrev, p, step, xNow, objEqs, numObjEqs);
-			fNow = _CalcObj(xNow, objEqs, numObjEqs);
-			std::cout << itCounter << " iterations, " <<	"f(x) = " << fNow << std::endl;
-
-			if (fNow < eps)
-			{
-				exit_con = true;
-				break;
-			}
-
-			// _CalcGrad(xNow, gNow, gradEqs);
+			
+			checkCudaErrors(cudaMemcpy(d_xprev, d_xnow, sizeof(double) * n, cudaMemcpyDeviceToDevice));
 
 
 			// if (fNow > fPrev) {
@@ -1214,18 +1456,47 @@ int BFGSSolveEqs()
 			// 	_VecCopy(gPrev, gNow);
 			// 	break;
 			// }
-
-			checkCudaErrors(cudaMemcpy(d_gnow, gNow.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
-			checkCudaErrors(cudaMemcpy(d_gprev, gPrev.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
-			checkCudaErrors(cudaMemcpy(d_H, H.data(), sizeof(double) * n * n, cudaMemcpyHostToDevice));
-			checkCudaErrors(cudaMemcpy(d_xnow, xNow.data(),	sizeof(double) * n, cudaMemcpyHostToDevice));
-			checkCudaErrors(cudaMemcpy(d_xprev, xPrev.data(), sizeof(double) * n, cudaMemcpyHostToDevice));
 			checkCudaErrors(cudaMemset(d_sy, 0, sizeof(double)));
 
-			gpuCalcGrad <<< 64, 64 >>>(d_xnow, d_gnow, n,  gradEqVals.size(), d_gradEqHeads, d_gradEqls, d_gradEqVals);
+			void *kernelArgsIntervel[] = {
+					(void*)&d_xprev, (void*)&step, (void*)&d_p, (void*)&d_xt, (void*)&n, (void*)&left, (void*)&right, 
+					(void*)&d_dot_result, (void*)&tmp, (void*)&d_objEqls, (void*)&numObjEqs, (void*)&allnumObj, (void*)&d_objEqHeads, (void*)&d_objEqHeads 
+			};
+
+			void *kernelArgsSep[] = {
+					(void*)&d_xprev, (void*)&d_p, (void*)&d_xt, (void*)&d_xnow, (void*)&n, (void*)&left, (void*)&right, 
+					(void*)&d_dot_result, (void*)&tmp, (void*)&d_objEqls, (void*)&numObjEqs, (void*)&allnumObj, (void*)&d_objEqHeads, (void*)&d_objEqVals 
+			};
 			
-			std::vector<double> gradEqVals2(gradEqVals.size());
-			checkCudaErrors(cudaMemcpy(gradEqVals2.data(), d_gradEqVals, sizeof(double) * gradEqVals.size(), cudaMemcpyDeviceToHost));
+			dim3 dimGrid1(16,1,1), dimBlock1(32,1,1);
+			checkCudaErrors(cudaLaunchCooperativeKernel((void *)gpuDetermineInterval,
+														dimGrid1, dimBlock1, kernelArgsIntervel,
+														sMemSize, NULL));
+
+			checkCudaErrors(cudaLaunchCooperativeKernel((void *)gpuGodenSep,
+														dimGrid1, dimBlock1, kernelArgsSep,
+														sMemSize, NULL));
+														
+			void *kernelArgsObj[] = {
+					(void*)&d_xnow, (void*)&tmp, (void*)&numObjEqs, (void*)&allnumObj, (void*)&d_objEqHeads, 
+					(void*)&d_objEqls, (void*)&d_objEqVals, (void*)&d_fnow 
+			};
+
+			checkCudaErrors(cudaLaunchCooperativeKernel((void *)gpuCalcObj,
+														dimGrid, dimBlock, kernelArgsObj,
+														sMemSize, NULL));
+			
+			checkCudaErrors(cudaMemcpy(&fNow, d_fnow, sizeof(double), cudaMemcpyDeviceToHost));
+			
+			std::cout << itCounter << " iterations, " <<	"f(x) = " << fNow << std::endl;
+
+			if (fNow < eps)
+			{
+				exit_con = true;
+				break;
+			}
+
+			gpuCalcGrad <<< 64, 64 >>>(d_xnow, d_gnow, n,  gradEqVals.size(), d_gradEqHeads, d_gradEqls, d_gradEqVals);
 
 			void *kernelArgs[] = {
 					(void*)&d_gprev, (void*)&d_gnow, (void*)&d_xprev, (void*)&d_xnow, 
@@ -1236,17 +1507,13 @@ int BFGSSolveEqs()
 
 			checkCudaErrors(cudaLaunchCooperativeKernel((void *)BFGSMultiply,
 														dimGrid, dimBlock, kernelArgs,
-														sMemSize, NULL));	
-
-			checkCudaErrors(cudaMemcpy(gNow.data(), d_gnow, sizeof(double) * n, cudaMemcpyDeviceToHost));
-
+														sMemSize, NULL));
 			fPrev = fNow;
-			gPrev = gNow;
-			xPrev = xNow;
+
+			checkCudaErrors(cudaMemcpy(d_gprev, d_gnow, sizeof(double) * n, cudaMemcpyDeviceToDevice));
+			checkCudaErrors(cudaMemcpy(d_xprev, d_xnow, sizeof(double) * n, cudaMemcpyDeviceToDevice));
 			double sy = 0;
-			checkCudaErrors(cudaMemcpy(p.data(), d_p, sizeof(double) * n, cudaMemcpyDeviceToHost));
 			checkCudaErrors(cudaMemcpy(&sy, d_sy, sizeof(double), cudaMemcpyDeviceToHost));
-			checkCudaErrors(cudaMemcpy(H.data(), d_H, sizeof(double) * n * n, cudaMemcpyDeviceToHost));
 
 			if(sy < epsZero1)
 			{
@@ -1289,6 +1556,8 @@ int BFGSSolveEqs()
 	checkCudaErrors(cudaFree(d_objEqHeads));
 	checkCudaErrors(cudaFree(d_gradEqVals));
 	checkCudaErrors(cudaFree(d_objEqVals));
+	checkCudaErrors(cudaFree(d_fnow));
+	checkCudaErrors(cudaFree(tmp));
 }
 
 int main()
