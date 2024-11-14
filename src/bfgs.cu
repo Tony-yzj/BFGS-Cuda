@@ -843,7 +843,7 @@ __device__ bool gpuHTerminate(
 	return true;
 }
 
-__device__ void gpuCalcEqGrad(double* x, EqInfo* etab, int st, int ed, double* vtab, int* flags)
+__device__ void gpuCalcEqGrad(double* x, EqInfo* etab, int st, int ed, double* vtab)
 {
 	int gthIdx = threadIdx.y;
 	int gridSize = blockDim.y;
@@ -914,7 +914,7 @@ __device__ void gpuCalcEq(double* x, EqInfo* etab, int st, int ed, double* vtab)
 
 
 __global__ void gpuCalcGrad(double* x, double* g, int n, int allnum, int* gradEqHeads,
-	EqInfo* eqs, double* gradEqVal, int* flags)
+	EqInfo* eqs, double* gradEqVal)
 {
 	int gthIdx = blockIdx.x * blockDim.x + threadIdx.x;
 	int gridSize = gridDim.x * blockDim.x;
@@ -925,7 +925,7 @@ __global__ void gpuCalcGrad(double* x, double* g, int n, int allnum, int* gradEq
 		int ed = item < 0 ? allnum : gradEqHeads[item + 1];
 		int st = item < 0 ? gradEqHeads[-item] : gradEqHeads[item];
 
-		gpuCalcEqGrad(x, eqs, st, ed, gradEqVal, flags);
+		gpuCalcEqGrad(x, eqs, st, ed, gradEqVal);
 
 		EqInfo eq = eqs[i];
 		if(eq._type == NODE_OPER)
@@ -980,7 +980,7 @@ __global__ void gpuCalcObj(double* x, double* tmp, int eqNum, int allNum, int* o
 }
 
 __device__ void gpuCalcGradx(double* x, double* g, int n, int allnum, int* gradEqHeads,
-	EqInfo* eqs, double* gradEqVal, int* flags, const cg::grid_group &grid)
+	EqInfo* eqs, double* gradEqVal, const cg::grid_group &grid)
 {
 	int gthIdx = blockIdx.x * blockDim.x + threadIdx.x;
 	int gridSize = gridDim.x * blockDim.x;
@@ -991,7 +991,7 @@ __device__ void gpuCalcGradx(double* x, double* g, int n, int allnum, int* gradE
 		int ed = item < 0 ? allnum : gradEqHeads[item + 1];
 		int st = item < 0 ? gradEqHeads[-item] : gradEqHeads[item];
 
-		gpuCalcEqGrad(x, eqs, st, ed, gradEqVal, flags);
+		gpuCalcEqGrad(x, eqs, st, ed, gradEqVal);
 
 		EqInfo eq = eqs[i];
 		if(eq._type == NODE_OPER)
@@ -1421,9 +1421,48 @@ int BFGSSolveEqs()
 			maxnum = gradEqHeads[i] - gradEqHeads[i - 1];
 	}
 
+	std::vector<int> depth(numGradEqs);
+	for(int j = numGradEqs-1; j >= 0; j--)
+	{
+		EqInfo eq = gradEqs[j];
+		if(eq._type != NODE_OPER)
+			depth[j] = 0;
+		else
+		{
+			// if(depth[eq._left] > depth[eq._right])
+			// {
+			// 	if(eq._op == gradEqs[eq._left]._op && (eq._op == OP_PLUS || eq._op == OP_TIME))
+			// 	{
+			// 		int leftChild = eq._left;
+			// 		int rightChild = eq._right;
+			// 		gradEqs[j]._left = depth[gradEqs[eq._left]._right] > depth[gradEqs[eq._left]._left]? gradEqs[eq._left]._right : gradEqs[eq._left]._left;
+			// 		gradEqs[leftChild]._left = depth[gradEqs[eq._left]._right] > depth[gradEqs[eq._left]._left]? gradEqs[eq._left]._left : gradEqs[eq._left]._right;
+			// 		gradEqs[leftChild]._right = rightChild;
+			// 		gradEqs[j]._right = leftChild;
+			// 		depth[leftChild] = max(depth[gradEqs[leftChild]._left], depth[rightChild]);
+			// 	}
+			// }
+			// if(depth[eq._left] < depth[eq._right])
+			// {
+			// 	if(eq._op == gradEqs[eq._right]._op && (eq._op == OP_PLUS || eq._op == OP_TIME))
+			// 	{
+			// 		int leftChild = eq._left;
+			// 		int rightChild = eq._right;
+			// 		gradEqs[j]._right = depth[gradEqs[eq._right]._right] > depth[gradEqs[eq._right]._left]? gradEqs[eq._right]._right : gradEqs[eq._right]._left;
+			// 		gradEqs[rightChild]._right = depth[gradEqs[eq._right]._right] > depth[gradEqs[eq._right]._right]? gradEqs[eq._right]._left : gradEqs[eq._right]._right;
+			// 		gradEqs[rightChild]._left = leftChild;
+			// 		gradEqs[j]._left = rightChild;
+			// 		depth[rightChild] = max(depth[gradEqs[rightChild]._right], depth[leftChild]);
+			// 	}
+			// }
+			depth[j] = max(depth[eq._left], depth[eq._right]) + 1;
+		}
+	}
+
+
 	double *d_gnow, *d_gprev, *d_xnow, *d_xprev, *left, *right, *d_xt, *d_s, *d_y, *d_yTH, *d_Hy, *d_p, *d_H, *d_sy, *d_dot_result, *d_gradEqVals, *d_objEqVals, *d_fprev, *d_fnow, *tmp;
 	EqInfo* d_gradEqls, *d_objEqls;
-	int* d_gradEqHeads, *d_objEqHeads, *flags;
+	int* d_gradEqHeads, *d_objEqHeads;
 	checkCudaErrors(cudaMalloc(&d_gnow, sizeof(double) * n));
 	checkCudaErrors(cudaMalloc(&d_gprev, sizeof(double) * n));
 	checkCudaErrors(cudaMalloc(&d_xnow, sizeof(double) * n));
@@ -1448,7 +1487,6 @@ int BFGSSolveEqs()
 	checkCudaErrors(cudaMalloc(&d_fprev, sizeof(double)));
 	checkCudaErrors(cudaMalloc(&d_fnow, sizeof(double)));
 	checkCudaErrors(cudaMalloc(&tmp, sizeof(double) * numObjEqs));
-	checkCudaErrors(cudaMalloc(&flags, sizeof(int) * maxnum));
 	checkCudaErrors(cudaMemcpy(d_gradEqHeads, gradEqHeads.data(), sizeof(int) * gradEqHeads.size(), cudaMemcpyHostToDevice));
 	checkCudaErrors(cudaMemcpy(d_objEqHeads, objEqHeads.data(), sizeof(int) * objEqHeads.size(), cudaMemcpyHostToDevice));
 	checkCudaErrors(cudaMemcpy(d_gradEqls, gradEqs.data(), sizeof(EqInfo) * gradEqs.size(), cudaMemcpyHostToDevice));
@@ -1514,12 +1552,12 @@ int BFGSSolveEqs()
 
 			void *kernelArgsIntervel[] = {
 					(void*)&d_xprev, (void*)&step, (void*)&d_p, (void*)&d_xt, (void*)&n, (void*)&left, (void*)&right, 
-					(void*)&d_dot_result, (void*)&tmp, (void*)&d_objEqls, (void*)&numObjEqs, (void*)&allnumObj, (void*)&d_objEqHeads, (void*)&d_objEqHeads, (void*)&flags
+					(void*)&d_dot_result, (void*)&tmp, (void*)&d_objEqls, (void*)&numObjEqs, (void*)&allnumObj, (void*)&d_objEqHeads, (void*)&d_objEqHeads
 			};
 
 			void *kernelArgsSep[] = {
 					(void*)&d_xprev, (void*)&d_p, (void*)&d_xt, (void*)&d_xnow, (void*)&n, (void*)&left, (void*)&right, 
-					(void*)&d_dot_result, (void*)&tmp, (void*)&d_objEqls, (void*)&numObjEqs, (void*)&allnumObj, (void*)&d_objEqHeads, (void*)&d_objEqVals, (void*)&flags
+					(void*)&d_dot_result, (void*)&tmp, (void*)&d_objEqls, (void*)&numObjEqs, (void*)&allnumObj, (void*)&d_objEqHeads, (void*)&d_objEqVals
 			};
 			
 			dim3 dimGrid1(16,1,1), dimBlock1(32,1,1);
@@ -1533,7 +1571,7 @@ int BFGSSolveEqs()
 														
 			void *kernelArgsObj[] = {
 					(void*)&d_xnow, (void*)&tmp, (void*)&numObjEqs, (void*)&allnumObj, (void*)&d_objEqHeads, 
-					(void*)&d_objEqls, (void*)&d_objEqVals, (void*)&d_fnow, (void*)&flags
+					(void*)&d_objEqls, (void*)&d_objEqVals, (void*)&d_fnow
 			};
 
 			checkCudaErrors(cudaLaunchCooperativeKernel((void *)gpuCalcObj,
@@ -1551,7 +1589,7 @@ int BFGSSolveEqs()
 			}
 			
 			dim3 dimGrad(8,64);
-			gpuCalcGrad <<< ((maxnum+512-1)/512), dimGrad >>>(d_xnow, d_gnow, n,  gradEqVals.size(), d_gradEqHeads, d_gradEqls, d_gradEqVals, flags);
+			gpuCalcGrad <<< ((maxnum+512-1)/512), dimGrad >>>(d_xnow, d_gnow, n,  gradEqVals.size(), d_gradEqHeads, d_gradEqls, d_gradEqVals);
 
 			void *kernelArgs[] = {
 					(void*)&d_gprev, (void*)&d_gnow, (void*)&d_xprev, (void*)&d_xnow, 
@@ -1612,6 +1650,9 @@ int BFGSSolveEqs()
 	checkCudaErrors(cudaFree(d_gradEqVals));
 	checkCudaErrors(cudaFree(d_objEqVals));
 	checkCudaErrors(cudaFree(d_fnow));
+	checkCudaErrors(cudaFree(d_fprev));
+	checkCudaErrors(cudaFree(left));
+	checkCudaErrors(cudaFree(right));
 	checkCudaErrors(cudaFree(tmp));
 }
 
